@@ -1,0 +1,234 @@
+---
+- name: Auditoria de Segurança do Sistema
+  hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    important_services:
+      - sshd
+      - firewalld
+      - ufw
+      - auditd
+      - fail2ban
+    ssl_ports:
+      - 443
+      - 8443
+    weak_ciphers:
+      - RC4
+      - DES
+      - 3DES
+      - MD5
+      - SHA1
+    
+  tasks:
+    - name: Verificar configurações de senha
+      block:
+        - name: Verificar política de senhas (Unix/Linux)
+          shell: grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_MIN_LEN' /etc/login.defs
+          register: password_policy
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Verificar política de senhas (Windows)
+          win_shell: |
+            $policy = Get-WmiObject -Class Win32_AccountPolicy -Namespace root\rsop\computer
+            "MaximumPasswordAge: " + $policy.MaximumPasswordAge
+            "MinimumPasswordAge: " + $policy.MinimumPasswordAge
+            "MinimumPasswordLength: " + $policy.MinimumPasswordLength
+          register: password_policy
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar contas de usuário
+      block:
+        - name: Listar usuários com UID 0 (Unix/Linux)
+          shell: awk -F: '($3 == "0") {print $1}' /etc/passwd
+          register: root_users
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Listar contas de administrador (Windows)
+          win_shell: Get-LocalGroupMember -Group "Administrators" | Select-Object Name
+          register: admin_users
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar serviços em execução
+      block:
+        - name: Listar serviços em execução (Unix/Linux)
+          shell: systemctl list-units --type=service --state=running
+          register: running_services
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Listar serviços em execução (Windows)
+          win_shell: Get-Service | Where-Object {$_.Status -eq "Running"}
+          register: running_services
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar portas abertas
+      block:
+        - name: Listar portas abertas (Unix/Linux)
+          shell: ss -tuln
+          register: open_ports
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Listar portas abertas (Windows)
+          win_shell: Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,State | Where-Object {$_.State -eq "Listen"}
+          register: open_ports
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar configurações de firewall
+      block:
+        - name: Verificar status do firewall (Unix/Linux)
+          shell: |
+            if command -v ufw >/dev/null 2>&1; then
+              ufw status
+            elif command -v firewall-cmd >/dev/null 2>&1; then
+              firewall-cmd --state
+            else
+              echo "Firewall não detectado"
+            fi
+          register: firewall_status
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Verificar status do firewall (Windows)
+          win_shell: Get-NetFirewallProfile | Select-Object Name, Enabled
+          register: firewall_status
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar atualizações pendentes
+      block:
+        - name: Verificar atualizações (Debian/Ubuntu)
+          shell: /usr/lib/update-notifier/apt-check --human-readable
+          register: pending_updates
+          changed_when: false
+          when: ansible_os_family == "Debian"
+
+        - name: Verificar atualizações (RedHat/CentOS)
+          shell: yum check-update --quiet
+          register: pending_updates
+          changed_when: false
+          failed_when: pending_updates.rc not in [0, 100]
+          when: ansible_os_family == "RedHat"
+
+        - name: Verificar atualizações (Windows)
+          win_shell: Get-WUList
+          register: pending_updates
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Verificar protocolos SSL/TLS e cifras
+      block:
+        - name: Verificar versões SSL/TLS suportadas (Unix/Linux)
+          shell: |
+            for port in {{ ssl_ports | join(' ') }}; do
+              echo "Verificando porta $port:"
+              openssl s_client -connect localhost:$port < /dev/null 2>/dev/null | grep "Protocol"
+              echo "Cifras suportadas:"
+              openssl ciphers -v | awk '{print $2}'
+            done
+          register: ssl_check
+          ignore_errors: yes
+          changed_when: false
+          when: ansible_os_family != "Windows"
+
+        - name: Verificar versões SSL/TLS suportadas (Windows)
+          win_shell: |
+            $ports = @({{ ssl_ports | join(',') }})
+            foreach ($port in $ports) {
+              Write-Output "Verificando porta $port:"
+              $TcpClient = New-Object Net.Sockets.TcpClient
+              try {
+                $TcpClient.Connect("localhost", $port)
+                $SslStream = New-Object System.Net.Security.SslStream($TcpClient.GetStream())
+                $SslStream.AuthenticateAsClient("localhost")
+                Write-Output "Protocolo: $($SslStream.SslProtocol)"
+                Write-Output "Cifra: $($SslStream.CipherAlgorithm)"
+              } catch {
+                Write-Output "Erro ao conectar na porta $port"
+              } finally {
+                if ($SslStream) { $SslStream.Dispose() }
+                if ($TcpClient) { $TcpClient.Dispose() }
+              }
+            }
+          register: ssl_check
+          ignore_errors: yes
+          changed_when: false
+          when: ansible_os_family == "Windows"
+
+    - name: Analisar resultados SSL/TLS
+      set_fact:
+        ssl_analysis: |
+          {% set obsolete_protocols = ['SSLv2', 'SSLv3', 'TLSv1.0', 'TLSv1.1'] %}
+          {% set weak_ciphers = weak_ciphers %}
+          {% set issues = [] %}
+          {% for line in ssl_check.stdout_lines %}
+            {% for protocol in obsolete_protocols %}
+              {% if protocol in line %}
+                {% set _ = issues.append('Protocolo obsoleto detectado: ' + protocol) %}
+              {% endif %}
+            {% endfor %}
+            {% for cipher in weak_ciphers %}
+              {% if cipher in line %}
+                {% set _ = issues.append('Cifra fraca detectada: ' + cipher) %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ issues | join('\n') }}
+
+    - name: Gerar relatório de auditoria
+      debug:
+        msg: |
+          Relatório de Auditoria de Segurança para {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }}):
+          
+          1. Política de Senhas:
+          {{ password_policy.stdout_lines | default(['Não foi possível obter informações da política de senhas']) | join('\n') }}
+          
+          2. Contas Privilegiadas:
+          {% if ansible_os_family != "Windows" %}
+          Usuários com UID 0: {{ root_users.stdout_lines | default(['Nenhum']) | join(', ') }}
+          {% else %}
+          Contas de Administrador: {{ admin_users.stdout_lines | default(['Nenhum']) | join(', ') }}
+          {% endif %}
+          
+          3. Serviços em Execução:
+          {{ running_services.stdout_lines | default(['Não foi possível obter informações dos serviços']) | join('\n') }}
+          
+          4. Portas Abertas:
+          {{ open_ports.stdout_lines | default(['Não foi possível obter informações das portas abertas']) | join('\n') }}
+          
+          5. Status do Firewall:
+          {{ firewall_status.stdout_lines | default(['Não foi possível obter informações do firewall']) | join('\n') }}
+          
+          6. Atualizações Pendentes:
+          {{ pending_updates.stdout_lines | default(['Não foi possível verificar atualizações pendentes']) | join('\n') }}
+
+          7. Verificação SSL/TLS:
+          {{ ssl_check.stdout_lines | default(['Não foi possível verificar configurações SSL/TLS']) | join('\n') }}
+          
+          Análise SSL/TLS:
+          {{ ssl_analysis | default('Nenhum problema SSL/TLS detectado') }}
+          
+          Recomendações de Hardening:
+          - Revise a política de senhas para garantir complexidade e rotação adequadas.
+          - Minimize o número de contas com privilégios elevados.
+          - Desative ou remova serviços desnecessários.
+          - Feche portas não essenciais e restrinja o acesso às portas necessárias.
+          - Ative e configure adequadamente o firewall.
+          - Mantenha o sistema atualizado aplicando as atualizações pendentes.
+          - Implemente autenticação de dois fatores onde possível.
+          - Configure logging e monitoramento adequados.
+          - Aplique o princípio do menor privilégio para todos os usuários e serviços.
+          - Desative protocolos SSL/TLS obsoletos (SSLv2, SSLv3, TLSv1.0, TLSv1.1).
+          - Remova suporte para cifras fracas ou inseguras.
+          - Configure os serviços para usar apenas TLSv1.2 ou superior.
+          - Implemente o uso de certificados fortes e mantenha-os atualizados.
+          - Utilize Perfect Forward Secrecy (PFS) em suas configurações SSL/TLS.
+          - Habilite HTTP Strict Transport Security (HSTS) para serviços web.
